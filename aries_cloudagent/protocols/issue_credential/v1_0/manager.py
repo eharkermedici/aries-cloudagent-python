@@ -59,7 +59,7 @@ class CredentialManager:
 
         storage: BaseStorage = await self.context.inject(BaseStorage)
         found = await storage.search_records(
-            type_filter=CRED_DEF_SENT_RECORD_TYPE, tag_query=tag_query,
+            type_filter=CRED_DEF_SENT_RECORD_TYPE, tag_query=tag_query
         ).fetch_all()
         if not found:
             raise CredentialManagerError(
@@ -70,7 +70,9 @@ class CredentialManager:
     async def prepare_send(
         self,
         connection_id: str,
-        credential_proposal: CredentialProposal
+        credential_proposal: CredentialProposal,
+        revoc_reg_id: str = None,
+        auto_remove: bool = True,
     ) -> Tuple[V10CredentialExchange, CredentialOffer]:
         """
         Set up a new credential exchange for an automated send.
@@ -79,6 +81,8 @@ class CredentialManager:
             connection_id: Connection to create offer for
             credential_proposal: The credential proposal with preview on
                 attribute values to use if auto_issue is enabled
+            revoc_reg_id: ID of the revocation registry to use
+            auto_remove: Flag to automatically remove the record on completion
 
         Returns:
             A tuple of the new credential exchange record and credential offer message
@@ -86,10 +90,12 @@ class CredentialManager:
         """
         credential_exchange = V10CredentialExchange(
             auto_issue=True,
+            auto_remove=auto_remove,
             connection_id=connection_id,
             initiator=V10CredentialExchange.INITIATOR_SELF,
             role=V10CredentialExchange.ROLE_ISSUER,
             credential_proposal_dict=credential_proposal.serialize(),
+            revoc_reg_id=revoc_reg_id,
         )
         (credential_exchange, credential_offer) = await self.create_offer(
             credential_exchange_record=credential_exchange,
@@ -102,6 +108,7 @@ class CredentialManager:
         connection_id: str,
         *,
         auto_offer: bool = None,
+        auto_remove: bool = True,
         comment: str = None,
         credential_preview: CredentialPreview = None,
         schema_id: str = None,
@@ -110,6 +117,7 @@ class CredentialManager:
         schema_version: str = None,
         cred_def_id: str = None,
         issuer_did: str = None,
+        revoc_reg_id: str = None,
     ) -> V10CredentialExchange:
         """
         Create a credential proposal.
@@ -118,6 +126,7 @@ class CredentialManager:
             connection_id: Connection to create proposal for
             auto_offer: Should this proposal request automatically be handled to
                 offer a credential
+            auto_remove: Should the record be automatically removed on completion
             comment: Optional human-readable comment to include in proposal
             credential_preview: The credential preview to use to create
                 the credential proposal
@@ -127,6 +136,7 @@ class CredentialManager:
             schema_version: Schema version for credential proposal
             cred_def_id: Credential definition id for credential proposal
             issuer_did: Issuer DID for credential proposal
+            revoc_reg_id: ID of the revocation registry to use
 
         Returns:
             Resulting credential exchange record including credential proposal
@@ -151,6 +161,8 @@ class CredentialManager:
             state=V10CredentialExchange.STATE_PROPOSAL_SENT,
             credential_proposal_dict=credential_proposal_message.serialize(),
             auto_offer=auto_offer,
+            auto_remove=auto_remove,
+            revoc_reg_id=revoc_reg_id,
         )
         await credential_exchange_record.save(
             self.context, reason="create credential proposal"
@@ -222,6 +234,19 @@ class CredentialManager:
             cred_preview = None
 
         async def _create(cred_def_id):
+            ledger: BaseLedger = await self.context.inject(BaseLedger)
+            async with ledger:
+                credential_definition = await ledger.get_credential_definition(
+                    cred_def_id
+                )
+            if (
+                credential_definition["value"].get("revocation")
+                and not credential_exchange_record.revoc_reg_id
+            ):
+                raise CredentialManagerError(
+                    "Missing revocation registry ID for revocable credential definition"
+                )
+
             issuer: BaseIssuer = await self.context.inject(BaseIssuer)
             return await issuer.create_credential_offer(cred_def_id)
 
@@ -462,13 +487,31 @@ class CredentialManager:
             async with ledger:
                 schema = await ledger.get_schema(schema_id)
 
+            if credential_exchange_record.revoc_reg_id:
+                revoc = IndyRevocation(self.context)
+                registry_record = await revoc.get_issuer_revocation_record(
+                    credential_exchange_record.revoc_reg_id
+                )
+                # FIXME exception on missing
+
+                registry = await registry_record.get_registry()
+                tails_reader = await registry.create_tails_reader()
+            else:
+                tails_reader = None
+
             issuer: BaseIssuer = await self.context.inject(BaseIssuer)
             (
                 credential_exchange_record.credential,
-                _,  # credential_revocation_id
+                credential_exchange_record.revocation_id,
             ) = await issuer.create_credential(
-                schema, credential_offer, credential_request, credential_values
+                schema,
+                credential_offer,
+                credential_request,
+                credential_values,
+                credential_exchange_record.revoc_reg_id,
+                tails_reader,
             )
+            # FIXME - exception if registry is full?
 
         credential_exchange_record.state = V10CredentialExchange.STATE_ISSUED
         await credential_exchange_record.save(self.context, reason="issue credential")
@@ -539,8 +582,9 @@ class CredentialManager:
 
         holder: BaseHolder = await self.context.inject(BaseHolder)
         if (
-            credential_exchange_record.credential_proposal_dict and
-            "credential_proposal" in credential_exchange_record.credential_proposal_dict
+            credential_exchange_record.credential_proposal_dict
+            and "credential_proposal"
+            in credential_exchange_record.credential_proposal_dict
         ):
             mime_types = CredentialPreview.deserialize(
                 credential_exchange_record.credential_proposal_dict[
@@ -554,7 +598,7 @@ class CredentialManager:
             credential_definition,
             raw_credential,
             credential_exchange_record.credential_request_metadata,
-            mime_types
+            mime_types,
         )
 
         credential = await holder.get_credential(credential_id)
@@ -570,8 +614,10 @@ class CredentialManager:
             credential_exchange_record.parent_thread_id,
         )
 
-        # Delete the exchange record since we're done with it
-        await credential_exchange_record.delete_record(self.context)
+        if credential_exchange_record.auto_remove:
+            # Delete the exchange record since we're done with it
+            await credential_exchange_record.delete_record(self.context)
+
         return (credential_exchange_record, credential_ack_message)
 
     async def receive_credential_ack(self) -> V10CredentialExchange:
@@ -594,8 +640,9 @@ class CredentialManager:
         credential_exchange_record.state = V10CredentialExchange.STATE_ACKED
         await credential_exchange_record.save(self.context, reason="credential acked")
 
-        # We're done with the exchange so delete
-        await credential_exchange_record.delete_record(self.context)
+        if credential_exchange_record.auto_remove:
+            # We're done with the exchange so delete
+            await credential_exchange_record.delete_record(self.context)
 
         return credential_exchange_record
 
