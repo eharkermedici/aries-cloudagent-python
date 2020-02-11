@@ -154,12 +154,18 @@ async def main(start_port: int, show_timing: bool = False):
                 "degree schema", version, ["name", "date", "degree", "age"]
             )
 
+        with log_timer("Publish revocation registry duration:"):
+            log_status("#5/6 Create and publish the revocation registry on the ledger")
+            revocation_registry_id = await agent.create_and_publish_revocation_registry(
+                credential_definition_id, 2
+            )
+
         # TODO add an additional credential for Student ID
 
         with log_timer("Generate invitation duration:"):
             # Generate an invitation
             log_status(
-                "#5 Create a connection to alice and print out the invite details"
+                "#7 Create a connection to alice and print out the invite details"
             )
             connection = await agent.admin_POST("/connections/create-invitation")
 
@@ -286,6 +292,21 @@ if __name__ == "__main__":
         "--timing", action="store_true", help="Enable timing information"
     )
     args = parser.parse_args()
+
+    ENABLE_PYDEVD_PYCHARM = os.getenv("ENABLE_PYDEVD_PYCHARM", "").lower()
+    ENABLE_PYDEVD_PYCHARM = ENABLE_PYDEVD_PYCHARM and ENABLE_PYDEVD_PYCHARM not in ("false", "0")
+    PYDEVD_PYCHARM_HOST = os.getenv("PYDEVD_PYCHARM_HOST", "localhost")
+    PYDEVD_PYCHARM_CONTROLLER_PORT = int(os.getenv("PYDEVD_PYCHARM_CONTROLLER_PORT", 5001))
+
+    if ENABLE_PYDEVD_PYCHARM:
+        try:
+            import pydevd_pycharm
+
+            print(f"Faber remote debugging to {PYDEVD_PYCHARM_HOST}:{PYDEVD_PYCHARM_CONTROLLER_PORT}")
+            pydevd_pycharm.settrace(host=PYDEVD_PYCHARM_HOST, port=PYDEVD_PYCHARM_CONTROLLER_PORT,
+                                    stdoutToServer=True, stderrToServer=True, suspend=False)
+        except ImportError:
+            print("pydevd_pycharm library was not found")
 
     require_indy()
 
