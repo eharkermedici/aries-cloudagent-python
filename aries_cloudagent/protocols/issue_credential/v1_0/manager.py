@@ -579,6 +579,8 @@ class CredentialManager:
             credential_definition = await ledger.get_credential_definition(
                 raw_credential["cred_def_id"]
             )
+            if raw_credential["rev_reg_id"]:
+                revoc_reg_def = await ledger.get_revoc_reg_def(raw_credential["rev_reg_id"])
 
         holder: BaseHolder = await self.context.inject(BaseHolder)
         if (
@@ -595,10 +597,12 @@ class CredentialManager:
             mime_types = None
 
         credential_id = await holder.store_credential(
-            credential_definition,
-            raw_credential,
-            credential_exchange_record.credential_request_metadata,
-            mime_types,
+            credential_definition=credential_definition,
+            credential_data=raw_credential,
+            credential_request_metadata=credential_exchange_record.credential_request_metadata,
+            credential_attr_mime_types=mime_types,
+            credential_id=None,
+            rev_reg_def_json=revoc_reg_def
         )
 
         credential = await holder.get_credential(credential_id)
@@ -606,6 +610,9 @@ class CredentialManager:
         credential_exchange_record.state = V10CredentialExchange.STATE_ACKED
         credential_exchange_record.credential_id = credential_id
         credential_exchange_record.credential = credential
+        credential_exchange_record.revoc_reg_id = credential.get("rev_reg_id", None)
+        credential_exchange_record.revocation_id = credential.get("cred_rev_id", None)
+
         await credential_exchange_record.save(self.context, reason="store credential")
 
         credential_ack_message = CredentialAck()
