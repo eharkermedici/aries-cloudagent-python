@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import sys
+import time
 
 from uuid import uuid4
 
@@ -220,7 +221,7 @@ async def main(start_port: int, show_timing: bool = False):
                 req_attrs = [
                     {"name": "name", "restrictions": [{"issuer_did": agent.did}]},
                     {"name": "date", "restrictions": [{"issuer_did": agent.did}]},
-                    {"name": "degree", "restrictions": [{"issuer_did": agent.did}]},
+                    {"name": "degree", "restrictions": [{"issuer_did": agent.did}], "non_revoked": {"to": int(time.time()-1)}},
                     {"name": "self_attested_thing"},
                 ]
                 req_preds = [
@@ -242,6 +243,9 @@ async def main(start_port: int, show_timing: bool = False):
                         f"0_{req_pred['name']}_GE_uuid": req_pred
                         for req_pred in req_preds
                     },
+                    "non_revoked": {
+                        "to": int(time.time())
+                    }
                 }
                 proof_request_web_request = {
                     "connection_id": agent.connection_id,
