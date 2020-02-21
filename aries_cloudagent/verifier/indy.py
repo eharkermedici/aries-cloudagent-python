@@ -86,9 +86,8 @@ class IndyVerifier(BaseVerifier):
 
             return True
 
-    async def verify_presentation(
-        self, presentation_request, presentation, schemas, credential_definitions
-    ) -> bool:
+    async def verify_presentation(self, presentation_request, presentation, schemas, credential_definitions,
+                                  rev_reg_defs, rev_reg_entries) -> bool:
         """
         Verify a presentation.
 
@@ -97,6 +96,8 @@ class IndyVerifier(BaseVerifier):
             presentation: Presentation data
             schemas: Schema data
             credential_definitions: credential definition data
+            rev_reg_defs: revocation registry definitions
+            rev_reg_entries: revocation states
         """
 
         if not IndyVerifier.check_encoding(presentation_request, presentation):
@@ -111,8 +112,8 @@ class IndyVerifier(BaseVerifier):
             json.dumps(presentation),
             json.dumps(schemas),
             json.dumps(credential_definitions),
-            json.dumps({}),  # no revocation
-            json.dumps({}),
+            json.dumps(rev_reg_defs),  # no revocation
+            json.dumps(rev_reg_entries),
         )
 
         return verified
