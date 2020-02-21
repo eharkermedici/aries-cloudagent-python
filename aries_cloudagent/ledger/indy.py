@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 import tempfile
 
 from datetime import datetime, date
@@ -210,14 +211,12 @@ class IndyLedger(BaseLedger):
             The current instance
 
         """
-        await super().__aenter__()
         await self._context_open()
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
         """Context manager exit."""
         await self._context_close()
-        await super().__aexit__(exc_type, exc, tb)
 
     async def _submit(
         self,
@@ -363,7 +362,7 @@ class IndyLedger(BaseLedger):
             "schema_version": schema_id_parts[-1],
             "epoch": str(int(time())),
         }
-        record = StorageRecord(SCHEMA_SENT_RECORD_TYPE, schema_id, schema_tags)
+        record = StorageRecord(SCHEMA_SENT_RECORD_TYPE, schema_id, schema_tags,)
         storage = self.get_indy_storage()
         await storage.add_record(record)
 
@@ -495,22 +494,6 @@ class IndyLedger(BaseLedger):
 
         """
 
-        async def cred_def_in_wallet(wallet_handle, cred_def_id) -> bool:
-            """Create an offer to check whether cred def id is in wallet."""
-            try:
-                await indy.anoncreds.issuer_create_credential_offer(
-                    wallet_handle, cred_def_id
-                )
-                return True
-            except IndyError as error:
-                if error.error_code not in (
-                    ErrorCode.CommonInvalidStructure,
-                    ErrorCode.WalletItemNotFound,
-                ):
-                    raise IndyErrorHandler.wrap_error(error) from error
-                # recognized error signifies no such cred def in wallet: pass
-            return False
-
         public_info = await self.wallet.get_public_did()
         if not public_info:
             raise BadLedgerRequestError(
@@ -518,88 +501,79 @@ class IndyLedger(BaseLedger):
             )
 
         schema = await self.get_schema(schema_id)
-        if not schema:
-            raise LedgerError(f"Ledger {self.pool_name} has no schema {schema_id}")
+        if not tag:
+            tag = DEFAULT_CRED_DEF_TAG
 
-        # check if cred def is on ledger already
-        for test_tag in [tag] if tag else ["tag", DEFAULT_CRED_DEF_TAG]:
-            credential_definition_id = (
-                f"{public_info.did}:3:CL:{str(schema['seqNo'])}:{test_tag}"
+        try:
+            (
+                credential_definition_id,
+                credential_definition_json,
+            ) = await indy.anoncreds.issuer_create_and_store_credential_def(
+                self.wallet.handle,
+                public_info.did,
+                json.dumps(schema),
+                tag or "default",
+                "CL",
+                json.dumps({"support_revocation": support_revocation}),
             )
-            ledger_cred_def = await self.fetch_credential_definition(
-                credential_definition_id
-            )
-            if ledger_cred_def:
-                self.logger.warning(
-                    "Credential definition %s already exists on ledger %s",
-                    credential_definition_id,
-                    self.pool_name,
-                )
-                if not await cred_def_in_wallet(
-                    self.wallet.handle, credential_definition_id
-                ):
+        # If the cred def already exists in the wallet, we need some way of obtaining
+        # that cred def id (from schema id passed) since we can now assume we can use
+        # it in future operations.
+        except IndyError as error:
+            if error.error_code == ErrorCode.AnoncredsCredDefAlreadyExistsError:
+                try:
+                    credential_definition_id = re.search(
+                        r"\w*:3:CL:(([1-9][0-9]*)|(.{21,22}:2:.+:[0-9.]+)):\w*",
+                        error.message,
+                    ).group(0)
+                # The regex search failed so let the error bubble up
+                except AttributeError:
                     raise LedgerError(
-                        f"Credential definition {credential_definition_id} is on "
-                        f"ledger {self.pool_name} but not in wallet {self.wallet.name}"
+                        "Previous credential definition exists, but ID could "
+                        "not be extracted"
                     )
-                credential_definition_json = json.dumps(ledger_cred_def)
-                break
-        else:  # no such cred def on ledger
-            if await cred_def_in_wallet(self.wallet.handle, credential_definition_id):
-                raise LedgerError(
-                    f"Credential definition {credential_definition_id} is in wallet "
-                    f"{self.wallet.name} but not on ledger {self.pool_name}"
-                )
-
-            # Cred def is neither on ledger nor in wallet: create and send it
-            try:
-                (
-                    credential_definition_id,
-                    credential_definition_json,
-                ) = await indy.anoncreds.issuer_create_and_store_credential_def(
-                    self.wallet.handle,
-                    public_info.did,
-                    json.dumps(schema),
-                    tag or DEFAULT_CRED_DEF_TAG,
-                    "CL",
-                    json.dumps({"support_revocation": support_revocation}),
-                )
-            except IndyError as error:
+            else:
                 raise IndyErrorHandler.wrap_error(error) from error
-            else:  # created cred def in wallet OK
-                wallet_cred_def = json.loads(credential_definition_json)
-                with IndyErrorHandler("Exception when building cred def request"):
-                    request_json = await indy.ledger.build_cred_def_request(
-                        public_info.did, credential_definition_json
-                    )
-                await self._submit(request_json, True, sign_did=public_info)
-                ledger_cred_def = await self.fetch_credential_definition(
-                    credential_definition_id
+
+        # check if the cred def already exists on the ledger
+        cred_def = json.loads(credential_definition_json)
+        exist_def = await self.fetch_credential_definition(credential_definition_id)
+        if exist_def:
+            if exist_def["value"] != cred_def["value"]:
+                self.logger.warning(
+                    "Ledger definition of cred def %s will be replaced",
+                    credential_definition_id,
                 )
-                assert wallet_cred_def["value"] == ledger_cred_def["value"]
+                exist_def = None
 
-        # Add non-secrets records if not yet present
-        storage = self.get_indy_storage()
-        found = await storage.search_records(
-            type_filter=CRED_DEF_SENT_RECORD_TYPE,
-            tag_query={"cred_def_id": credential_definition_id},
-        ).fetch_all()
-
-        if not found:
-            schema_id_parts = schema_id.split(":")
-            cred_def_tags = {
-                "schema_id": schema_id,
-                "schema_issuer_did": schema_id_parts[0],
-                "schema_name": schema_id_parts[-2],
-                "schema_version": schema_id_parts[-1],
-                "issuer_did": public_info.did,
-                "cred_def_id": credential_definition_id,
-                "epoch": str(int(time())),
-            }
-            record = StorageRecord(
-                CRED_DEF_SENT_RECORD_TYPE, credential_definition_id, cred_def_tags
+        if not exist_def:
+            with IndyErrorHandler("Exception when building cred def request"):
+                request_json = await indy.ledger.build_cred_def_request(
+                    public_info.did, credential_definition_json
+                )
+            await self._submit(request_json, True, sign_did=public_info)
+        else:
+            self.logger.warning(
+                "Ledger definition of cred def %s already exists",
+                credential_definition_id,
             )
-            await storage.add_record(record)
+
+        schema_id_parts = schema_id.split(":")
+        cred_def_tags = {
+            "schema_id": schema_id,
+            "schema_issuer_did": schema_id_parts[0],
+            "schema_name": schema_id_parts[-2],
+            "schema_version": schema_id_parts[-1],
+            "issuer_did": public_info.did,
+            "cred_def_id": credential_definition_id,
+            "epoch": str(int(time())),
+        }
+        record = StorageRecord(
+            CRED_DEF_SENT_RECORD_TYPE, credential_definition_id, cred_def_tags,
+        )
+        storage = self.get_indy_storage()
+        await storage.add_record(record)
+        print(record.tags)
 
         return credential_definition_id, json.loads(credential_definition_json)
 
@@ -706,10 +680,9 @@ class IndyLedger(BaseLedger):
                 public_did, nym, "endpoint", None, None
             )
         response_json = await self._submit(request_json, sign_did=public_info)
-        data_json = json.loads(response_json)["result"]["data"]
-        if data_json:
-            endpoint = json.loads(data_json).get("endpoint", None)
-            address = endpoint.get("endpoint", None) if endpoint else None
+        endpoint_json = json.loads(response_json)["result"]["data"]
+        if endpoint_json:
+            address = json.loads(endpoint_json)["endpoint"].get("endpoint", None)
         else:
             address = None
 
@@ -831,15 +804,14 @@ class IndyLedger(BaseLedger):
         )
         storage = self.get_indy_storage()
         await storage.add_record(record)
-        if self.cache:
-            cache_key = TAA_ACCEPTED_RECORD_TYPE + "::" + self.pool_name
-            await self.cache.set(cache_key, acceptance, self.cache_duration)
+        cache_key = TAA_ACCEPTED_RECORD_TYPE + "::" + self.pool_name
+        await self.cache.set(cache_key, acceptance, self.cache_duration)
 
     async def get_latest_txn_author_acceptance(self) -> dict:
         """Look up the latest TAA acceptance."""
         cache_key = TAA_ACCEPTED_RECORD_TYPE + "::" + self.pool_name
-        acceptance = self.cache and await self.cache.get(cache_key)
-        if not acceptance:
+        acceptance = await self.cache.get(cache_key)
+        if acceptance is None:
             storage = self.get_indy_storage()
             tag_filter = {"pool_name": self.pool_name}
             found = await storage.search_records(
@@ -851,8 +823,7 @@ class IndyLedger(BaseLedger):
                 acceptance = records[0]
             else:
                 acceptance = {}
-            if self.cache:
-                await self.cache.set(cache_key, acceptance, self.cache_duration)
+            await self.cache.set(cache_key, acceptance, self.cache_duration)
         return acceptance
 
     async def get_revoc_reg_def(self, revoc_reg_id: str) -> dict:
@@ -867,40 +838,6 @@ class IndyLedger(BaseLedger):
         )
         assert found_id == revoc_reg_id
         return json.loads(found_def_json)
-
-    async def get_revoc_reg_entry(self, revoc_reg_id: str, timestamp: int):
-        """Look up a revocation registry entry by revocation registry ID and timestamp."""
-        public_info = await self.wallet.get_public_did()
-        fetch_req = await indy.ledger.build_get_revoc_reg_request(
-            public_info and public_info.did, revoc_reg_id, timestamp
-        )
-        response_json = await self._submit(fetch_req, sign_did=public_info)
-        (found_id, found_reg_json, timestamp2) = await indy.ledger.parse_get_revoc_reg_response(
-            response_json
-        )
-        assert found_id == revoc_reg_id
-        return json.loads(found_reg_json), timestamp2
-
-
-    async def get_revoc_reg_delta(self, revoc_reg_id: str, timestamp_from=0, timestamp_to=int(time())) -> (dict, int):
-        """
-        Look up a revocation registry delta by ID.
-        :param revoc_reg_id revocation registry id
-        :param timestamp_from from time. time represented as a total number of seconds from Unix Epoch
-        :param timestamp_to to time. time represented as a total number of seconds from Unix Epoch
-
-        :returns delta response, delta timestamp
-        """
-        public_info = await self.wallet.get_public_did()
-        fetch_req = await indy.ledger.build_get_revoc_reg_delta_request(
-            public_info and public_info.did, revoc_reg_id, timestamp_from, timestamp_to
-        )
-        response_json = await self._submit(fetch_req, sign_did=public_info)
-        (found_id, found_delta_json, delta_timestamp) = await indy.ledger.parse_get_revoc_reg_delta_response(
-            response_json
-        )
-        assert found_id == revoc_reg_id
-        return json.loads(found_delta_json), delta_timestamp
 
     async def send_revoc_reg_def(self, revoc_reg_def: dict, issuer_did: str = None):
         """Publish a revocation registry definition to the ledger."""

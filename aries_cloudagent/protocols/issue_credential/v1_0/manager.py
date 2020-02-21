@@ -3,7 +3,6 @@
 import logging
 from typing import Mapping, Tuple
 
-from ....revocation.models.revocation_registry import RevocationRegistry
 from ....cache.base import BaseCache
 from ....config.injection_context import InjectionContext
 from ....core.error import BaseError
@@ -60,7 +59,7 @@ class CredentialManager:
 
         storage: BaseStorage = await self.context.inject(BaseStorage)
         found = await storage.search_records(
-            type_filter=CRED_DEF_SENT_RECORD_TYPE, tag_query=tag_query
+            type_filter=CRED_DEF_SENT_RECORD_TYPE, tag_query=tag_query,
         ).fetch_all()
         if not found:
             raise CredentialManagerError(
@@ -143,6 +142,10 @@ class CredentialManager:
             Resulting credential exchange record including credential proposal
 
         """
+        # Credential preview must be present
+        if not credential_preview:
+            raise CredentialManagerError("credential_preview is not set")
+
         credential_proposal_message = CredentialProposal(
             comment=comment,
             credential_proposal=credential_preview,
@@ -496,7 +499,7 @@ class CredentialManager:
                 # FIXME exception on missing
 
                 registry = await registry_record.get_registry()
-                tails_reader = await registry.create_tails_reader(self.context)
+                tails_reader = await registry.create_tails_reader()
             else:
                 tails_reader = None
 
@@ -580,36 +583,17 @@ class CredentialManager:
             credential_definition = await ledger.get_credential_definition(
                 raw_credential["cred_def_id"]
             )
-            if raw_credential["rev_reg_id"]:
-                revoc_reg_def = await ledger.get_revoc_reg_def(raw_credential["rev_reg_id"])
 
         holder: BaseHolder = await self.context.inject(BaseHolder)
-        if (
-            credential_exchange_record.credential_proposal_dict
-            and "credential_proposal"
-            in credential_exchange_record.credential_proposal_dict
-        ):
-            mime_types = CredentialPreview.deserialize(
+        credential_id = await holder.store_credential(
+            credential_definition,
+            raw_credential,
+            credential_exchange_record.credential_request_metadata,
+            CredentialPreview.deserialize(
                 credential_exchange_record.credential_proposal_dict[
                     "credential_proposal"
                 ]
-            ).mime_types()
-        else:
-            mime_types = None
-
-        if raw_credential["rev_reg_id"]:
-            revoc_reg = RevocationRegistry.from_definition(revoc_reg_def, True)
-            if not revoc_reg.has_local_tails_file(self.context):
-                self._logger.info(f"Downloading the tail file for the revocation registry: {revoc_reg.registry_id}")
-                await revoc_reg.retrieve_tails(self.context)
-
-        credential_id = await holder.store_credential(
-            credential_definition=credential_definition,
-            credential_data=raw_credential,
-            credential_request_metadata=credential_exchange_record.credential_request_metadata,
-            credential_attr_mime_types=mime_types,
-            credential_id=None,
-            rev_reg_def_json=revoc_reg_def
+            ).mime_types(),
         )
 
         credential = await holder.get_credential(credential_id)
@@ -617,9 +601,6 @@ class CredentialManager:
         credential_exchange_record.state = V10CredentialExchange.STATE_ACKED
         credential_exchange_record.credential_id = credential_id
         credential_exchange_record.credential = credential
-        credential_exchange_record.revoc_reg_id = credential.get("rev_reg_id", None)
-        credential_exchange_record.revocation_id = credential.get("cred_rev_id", None)
-
         await credential_exchange_record.save(self.context, reason="store credential")
 
         credential_ack_message = CredentialAck()
@@ -684,11 +665,14 @@ class CredentialManager:
         # FIXME exception on missing
 
         registry = await registry_record.get_registry()
-        tails_reader = await registry.create_tails_reader(self.context)
+        tails_reader = await registry.create_tails_reader()
 
         delta = await issuer.revoke_credential(
             registry.registry_id, tails_reader, credential_exchange_record.revocation_id
         )
+
+        credential_exchange_record.state = V10CredentialExchange.STATE_REVOKED
+        await credential_exchange_record.save(self.context, reason="Revoked credential")
 
         # create entry and send to ledger
         if delta:
@@ -697,7 +681,3 @@ class CredentialManager:
                 await ledger.send_revoc_reg_entry(
                     registry.registry_id, registry.reg_def_type, delta
                 )
-
-        credential_exchange_record.state = V10CredentialExchange.STATE_REVOKED
-        await credential_exchange_record.save(self.context, reason="Revoked credential")
-
